@@ -1,0 +1,105 @@
+import json
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+from blind_benchmark import (run_benchmark, summarize, recall_by_severity, FAULTS,
+                             reference_stats, compute_signals, diagnose)
+from repair import simulate_repairs, abstention_table
+from evidence import build_packet, render_analysis, verify_numbers, generate_training_set
+
+
+def render_extras(ds_name, models, model_name, X_train, y_train, X_test, y_test, X_stress,
+                  active, severities, drift_features):
+    # ------------------------------------------------------------ blind benchmark
+    st.divider()
+    st.header("08. Blind diagnosis benchmark")
+    st.write("Random faults are injected; the platform diagnoses them from LABEL-FREE signals only "
+             "and is scored against the known truth. This measures the diagnosis itself.")
+    n_trials = st.slider("Trials", 100, 1000, 300, 100)
+    if st.button("Run blind benchmark"):
+        with st.spinner("Injecting faults and diagnosing..."):
+            trials = run_benchmark(X_train, X_test, n_trials=n_trials, seed=1)
+        st.session_state["bench"] = (ds_name, trials)
+    if "bench" in st.session_state and st.session_state["bench"][0] == ds_name:
+        trials = st.session_state["bench"][1]
+        summ, overall = summarize(trials)
+        a, b = st.columns(2)
+        a.metric("Exact fault-set accuracy", f"{overall['Exact fault-set accuracy']:.1%}")
+        b.metric("False alarms on fault-free trials", f"{overall['False-alarm rate on fault-free trials']:.1%}",
+                 help=f"{overall['Fault-free trials']} fault-free trials")
+        st.dataframe(summ.style.format({c: "{:.3f}" for c in summ.columns
+                                        if c not in ("Fault", "Trials with fault", "TP", "FP", "FN")}), width="stretch")
+        rb = pd.concat([recall_by_severity(trials, f) for f in FAULTS])
+        rb["Severity range"] = rb["bin"].astype(str)
+        st.plotly_chart(px.bar(rb, x="Severity range", y="Recall", color="Fault", facet_col="Fault",
+                               title="Detection recall by severity tercile"), width="stretch")
+        st.caption("Caveat: the estimators are built from the same fault families they are scored on, so "
+                   "this is an UPPER BOUND on real-world diagnosis. Compare the synthetic dataset with the "
+                   "real one: accuracy drops where features have large mean relative to spread (drift and "
+                   "scaling become hard to separate). A concept change P(y|x) is invisible without labels.")
+
+    # ------------------------------------------------------------ repair simulator
+    st.divider()
+    st.header("09. Repair simulator")
+    st.write("Which fix actually recovers performance? Stressed data is split into a repair set (30%) and "
+             "a held-out set used only for scoring.")
+    model = models[model_name]
+    if st.button("Simulate repairs"):
+        with st.spinner("Retraining candidates..."):
+            tab, info = simulate_repairs(model, X_train, y_train, X_test, X_stress, y_test,
+                                         drop_features=drift_features if "Feature Drift" in active else None)
+        st.session_state["repair"] = (ds_name, model_name, tab, info)
+    if "repair" in st.session_state and st.session_state["repair"][:2] == (ds_name, model_name):
+        _, _, tab, info = st.session_state["repair"]
+        st.write(f"Held-out AUROC: clean **{info['auc_clean_heldout']:.3f}**, stressed "
+                 f"**{info['auc_stressed_heldout']:.3f}** ({info['n_repair']} repair rows, "
+                 f"{info['n_heldout']} held-out rows).")
+        st.dataframe(tab.style.format({"AUROC": "{:.3f}", "Gain vs nothing": "{:+.3f}",
+                                       "Recovered share": "{:.0%}", "Brier": "{:.3f}", "ECE": "{:.3f}"}),
+                     width="stretch")
+        st.plotly_chart(px.bar(tab, x="Repair", y="AUROC", color="Significant gain",
+                               title="Held-out AUROC after each repair"), width="stretch")
+        st.caption("Recalibration changes confidence, not ranking, so AUROC stays put while Brier/ECE improve. "
+                   "Retraining uses labelled stressed rows; reweighting needs none. Gains are on one stress "
+                   "realisation; repeat across seeds before trusting a ranking.")
+        st.subheader("Abstention: answer only when confident")
+        st.dataframe(abstention_table(model.predict_proba(X_stress)[:, 1], y_test)
+                     .style.format({"Coverage": "{:.0%}", "Accuracy on answered": "{:.3f}"}), width="stretch")
+
+    # ------------------------------------------------------------ analyst
+    st.divider()
+    st.header("10. Reliability Analyst (evidence-grounded)")
+    ref = reference_stats(X_train, n_cur=len(X_stress))
+    sig = compute_signals(ref, X_stress)
+    diag = diagnose(sig, ref)
+    packet = build_packet(sig, diag)
+    text = render_analysis(packet)
+    rate, bad = verify_numbers(text, packet)
+    c1, c2 = st.columns(2)
+    c1.markdown("**What the blind diagnosis found**")
+    c1.text(text)
+    truth_map = {"Feature Drift": "Feature Drift" in active, "Feature Scaling": False,
+                 "Measurement Noise": "Measurement Noise" in active, "Missing Values": "Missing Values" in active}
+    cmp_df = pd.DataFrame({"Fault": FAULTS, "Injected (truth)": [truth_map[f] for f in FAULTS],
+                           "Diagnosed": [diag[f]["present"] for f in FAULTS]})
+    c2.markdown("**Versus what was actually injected**")
+    c2.dataframe(cmp_df, width="stretch")
+    st.metric("Faithfulness (numbers in text traceable to the evidence packet)", f"{rate:.0%}")
+    if bad:
+        st.warning(f"Unsupported numbers: {bad}")
+    st.caption("This template Analyst is deterministic. A fine-tuned model can replace it: run it on the same "
+               "packet and apply verify_numbers() to its output, then compare against this template.")
+    with st.expander("Evidence packet (JSON)"):
+        st.json(packet)
+    st.download_button("Download evidence packet", json.dumps(packet, indent=2), "evidence_packet.json")
+    if st.button("Generate Analyst training set (1000 examples)"):
+        with st.spinner("Generating from fault-injection runs..."):
+            ds = generate_training_set(X_train, X_test, n=1000, seed=7)
+        st.session_state["train_csv"] = ds.to_csv(index=False)
+    if "train_csv" in st.session_state:
+        st.download_button("Download training CSV (instruction, response)", st.session_state["train_csv"],
+                           "ai_reliability_analysis_v2.csv", mime="text/csv")
+        st.caption("Responses are written from the injected ground truth, not from the rule. Hold out whole "
+                   "fault combinations or a second dataset when testing the fine-tuned model.")
