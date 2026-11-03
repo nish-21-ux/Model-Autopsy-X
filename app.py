@@ -4,6 +4,9 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import hashlib
+
+from dataset_pipeline import prepare_uploaded_dataset
 
 from autopsy_intelligence import render_autopsy_intelligence
 
@@ -16,6 +19,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import roc_auc_score
 
 from data_loader import DATASETS, load_split
+from dataset_pipeline import prepare_uploaded_dataset
 from theme import apply_theme
 from stress import apply_components, COMPONENT_ORDER
 from metrics import (
@@ -31,7 +35,6 @@ from failure_v2 import (
     confidence_profile
 )
 
-
 # ==========================================
 # PAGE CONFIGURATION
 # ==========================================
@@ -43,16 +46,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.sidebar.title("MODEL AUTOPSY X - TEST")
-
-st.sidebar.title("TEST UPLOAD")
-
-
-test_file = st.sidebar.file_uploader(
-    "Upload CSV",
-    type=["csv"],
-    key="test_csv_upload"
-)
+st.sidebar.title("MODEL AUTOPSY X")
 apply_theme()
 
 st.title("🧬 MODEL AUTOPSY X")
@@ -62,105 +56,70 @@ st.caption(
     "Every number below carries uncertainty. Every diagnosis is checked "
     "by intervention, because the faults are injected and therefore known."
 )
-# ==============================
-# DATASET UPLOAD
-# ==============================
+
+# ==========================================
+# DATA & MODELS
+# ==========================================
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("## 📂 Dataset Upload")
+st.sidebar.header("Dataset Selection")
 
 uploaded_file = st.sidebar.file_uploader(
-    "Upload your ML dataset",
+    "Upload your ML dataset (CSV)",
     type=["csv"],
-    help="Upload a CSV file to use as your dataset."
+    key="model_autopsy_dataset"
 )
-
-uploaded_df = None
 
 if uploaded_file is not None:
     try:
         uploaded_df = pd.read_csv(uploaded_file)
 
         if uploaded_df.empty:
-            st.sidebar.error("The uploaded CSV is empty.")
-            uploaded_df = None
+            st.error("The uploaded CSV is empty.")
+            st.stop()
 
-        else:
-            st.sidebar.success("Dataset uploaded successfully!")
+        target_column = st.sidebar.selectbox(
+            "Select target column",
+            options=uploaded_df.columns.tolist()
+        )
 
-            with st.expander("📊 Preview Uploaded Dataset", expanded=True):
-
-                st.write("### Dataset Information")
-
-                col1, col2 = st.columns(2)
-                col1.metric("Total Rows", len(uploaded_df))
-                col2.metric("Total Columns", len(uploaded_df.columns))
-
-                st.write("### Dataset Preview")
-                st.dataframe(uploaded_df.head(10), use_container_width=True)
-
-                st.write("### Missing Values")
-                missing_summary = uploaded_df.isna().sum()
-
-                st.dataframe(
-                    missing_summary.rename("Missing Values").to_frame(),
-                    use_container_width=True
-                )
-
-                st.write("### Column Information")
-                st.dataframe(
-                    pd.DataFrame({
-                        "Column": uploaded_df.columns,
-                        "Data Type": uploaded_df.dtypes.astype(str).values,
-                        "Missing Values": uploaded_df.isna().sum().values
-                    }),
-                    use_container_width=True
-                )
-
-            st.write("### 🎯 Select Prediction Target")
-
-            target_column = st.selectbox(
-                "Select the column your model should predict:",
-                uploaded_df.columns.tolist(),
-                key="uploaded_target_column"
+        try:
+            X_train, X_test, y_train, y_test, dataset_metadata = (
+                prepare_uploaded_dataset(uploaded_df, target_column)
             )
+            DS_NAME = f"Uploaded: {uploaded_file.name}"
+
+        except ValueError as e:
+            st.error(f"Dataset preparation failed: {e}")
+            st.stop()
 
     except Exception as e:
-        uploaded_df = None
-        st.sidebar.error(f"Unable to read uploaded CSV: {e}")
+        st.error(f"Could not read the CSV file: {e}")
+        st.stop()
 
+else:
+    DS_NAME = st.sidebar.selectbox(
+        "Choose built-in dataset",
+        DATASETS
+    )
 
-    except Exception as e:
+    @st.cache_data
+    def generate_data(name):
+        return load_split(name)
 
-        st.error(f"Unable to read uploaded CSV: {e}")
+    X_train, X_test, y_train, y_test = generate_data(DS_NAME)
+    dataset_metadata = {
+        "source": "Built-in dataset",
+        "target": "Existing dataset target"
+    }
 
-
-# ==========================================
-# DATA & MODELS
-# ==========================================
-
-DS_NAME = st.sidebar.selectbox(
-    "Dataset",
-    DATASETS
-)
-
-
-@st.cache_data
-def generate_data(name):
-    return load_split(name)
-
-
-X_train, X_test, y_train, y_test = generate_data(DS_NAME)
-
-REF_STD = X_train.std()
+REF_STD = X_train.std().fillna(0)
 REF_MEDIAN = X_train.median()
 
 
 @st.cache_resource
-def train_models(name):
-
+def train_models(dataset_key, X, y):
     models = {
-
         "Random Forest": make_pipeline(
             SimpleImputer(strategy="median"),
             RandomForestClassifier(
@@ -184,18 +143,29 @@ def train_models(name):
         ),
     }
 
-    for m in models.values():
-        m.fit(X_train, y_train)
+    for model in models.values():
+        model.fit(X, y)
 
     return models
 
 
-models = train_models(DS_NAME)
+models = train_models(
+    DS_NAME,
+    X_train,
+    y_train
+)
 
 rf_importance = pd.Series(
     models["Random Forest"][-1].feature_importances_,
     index=X_train.columns
 ).sort_values(ascending=False)
+
+st.sidebar.success(f"Dataset ready: {DS_NAME}")
+st.sidebar.caption(
+    f"Training rows: {len(X_train)} | "
+    f"Testing rows: {len(X_test)} | "
+    f"Features: {X_train.shape[1]}"
+)
 
 
 # ==========================================
@@ -246,6 +216,10 @@ SEED = st.sidebar.number_input(
     0, 10_000, 0
 )
 
+# ==========================================
+# MODEL SELECTION
+# ==========================================
+
 selected_model_name = st.sidebar.selectbox(
     "Model under investigation",
     list(models.keys())
@@ -256,132 +230,208 @@ selected_model_name = st.sidebar.selectbox(
 # APPLY STRESS CONDITIONS
 # ==========================================
 
-X_stress = apply_components(
-    X_test,
-    active,
-    severities,
-    SEED,
-    REF_STD,
-    drift_features
-)
+try:
+    X_stress = apply_components(
+        X_test.copy(),
+        active,
+        severities,
+        SEED,
+        REF_STD,
+        drift_features
+    )
 
-scenario_label = (
-    " + ".join(c for c in COMPONENT_ORDER if c in active)
-    or "Clean Data"
-)
+    scenario_label = (
+        " + ".join(
+            c for c in COMPONENT_ORDER if c in active
+        )
+        or "Clean Data"
+    )
 
-proba_clean = {
-    n: m.predict_proba(X_test)[:, 1]
-    for n, m in models.items()
-}
+    proba_clean = {
+        name: model.predict_proba(X_test)[:, 1]
+        for name, model in models.items()
+    }
 
-proba_stress = {
-    n: m.predict_proba(X_stress)[:, 1]
-    for n, m in models.items()
-}
+    proba_stress = {
+        name: model.predict_proba(X_stress)[:, 1]
+        for name, model in models.items()
+    }
+
+except Exception as e:
+    st.error(f"Stress testing failed: {e}")
+    st.stop()
+
 
 st.info(
     f"**Scenario:** {scenario_label} | "
-    f"seed {SEED} | "
-    f"test rows {len(y_test)} | "
-    f"drifted features: "
+    f"Seed: {SEED} | "
+    f"Test rows: {len(y_test)} | "
+    f"Drifted features: "
     f"{', '.join(drift_features) if 'Feature Drift' in active else '-'}"
 )
-
 
 # ==========================================
 # 01 PERFORMANCE WITH UNCERTAINTY
 # ==========================================
 
 st.divider()
-st.header("01. Performance with uncertainty")
+st.header("01 | Performance with Uncertainty")
 
-rows = []
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    roc_auc_score,
+    matthews_corrcoef,
+    brier_score_loss,
+    log_loss
+)
 
-for n in models:
+performance_rows = []
 
-    clean = metric_suite(y_test, proba_clean[n])
-    stressed = metric_suite(y_test, proba_stress[n])
+for model_name, model in models.items():
 
-    a, lo, hi = bootstrap_ci(
-        y_test,
-        proba_stress[n],
-        "AUROC"
-    )
+    clean_prob = proba_clean[model_name]
+    stress_prob = proba_stress[model_name]
 
-    rows.append({
-        "Model": n,
-        "AUROC (clean)": clean["AUROC"],
-        "AUROC (stressed)": a,
-        "95% CI": f"[{lo:.3f}, {hi:.3f}]",
-        "Accuracy": stressed["Accuracy"],
-        "F1": stressed["F1"],
-        "Balanced Acc": stressed["Balanced Acc"],
-        "MCC": stressed["MCC"],
-        "Brier": stressed["Brier"],
-        "ECE": stressed["ECE"],
-        "ECE (clean)": clean["ECE"]
+    clean_pred = (clean_prob >= 0.5).astype(int)
+    stress_pred = (stress_prob >= 0.5).astype(int)
+
+    performance_rows.append({
+        "Model": model_name,
+        "Condition": "Clean",
+        "Accuracy": accuracy_score(y_test, clean_pred),
+        "Precision": precision_score(
+            y_test, clean_pred, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_test, clean_pred, zero_division=0
+        ),
+        "F1 Score": f1_score(
+            y_test, clean_pred, zero_division=0
+        ),
+        "Balanced Accuracy": balanced_accuracy_score(
+            y_test, clean_pred
+        ),
+        "AUROC": roc_auc_score(y_test, clean_prob),
+        "MCC": matthews_corrcoef(y_test, clean_pred),
+        "Brier Score": brier_score_loss(y_test, clean_prob),
+        "Log Loss": log_loss(
+            y_test, clean_prob, labels=[0, 1]
+        )
     })
 
-perf_df = pd.DataFrame(rows)
+    performance_rows.append({
+        "Model": model_name,
+        "Condition": "Stressed",
+        "Accuracy": accuracy_score(y_test, stress_pred),
+        "Precision": precision_score(
+            y_test, stress_pred, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_test, stress_pred, zero_division=0
+        ),
+        "F1 Score": f1_score(
+            y_test, stress_pred, zero_division=0
+        ),
+        "Balanced Accuracy": balanced_accuracy_score(
+            y_test, stress_pred
+        ),
+        "AUROC": roc_auc_score(y_test, stress_prob),
+        "MCC": matthews_corrcoef(y_test, stress_pred),
+        "Brier Score": brier_score_loss(y_test, stress_prob),
+        "Log Loss": log_loss(
+            y_test, stress_prob, labels=[0, 1]
+        )
+    })
+
+performance_df = pd.DataFrame(performance_rows)
+
+st.subheader("Model Performance Comparison")
 
 st.dataframe(
-    perf_df.style.format({
-        c: "{:.3f}"
-        for c in perf_df.columns
-        if c not in ("Model", "95% CI")
-    }),
-    width="stretch"
+    performance_df.round(4),
+    use_container_width=True,
+    hide_index=True
+)
+
+selected_performance = performance_df[
+    performance_df["Model"] == selected_model_name
+]
+
+col1, col2, col3, col4 = st.columns(4)
+
+clean_metrics = selected_performance[
+    selected_performance["Condition"] == "Clean"
+].iloc[0]
+
+stress_metrics = selected_performance[
+    selected_performance["Condition"] == "Stressed"
+].iloc[0]
+
+col1.metric(
+    "Clean Accuracy",
+    f"{clean_metrics['Accuracy']:.3f}"
+)
+
+col2.metric(
+    "Stressed Accuracy",
+    f"{stress_metrics['Accuracy']:.3f}",
+    delta=f"{stress_metrics['Accuracy'] - clean_metrics['Accuracy']:.3f}"
+)
+
+col3.metric(
+    "Clean F1",
+    f"{clean_metrics['F1 Score']:.3f}"
+)
+
+col4.metric(
+    "Stressed F1",
+    f"{stress_metrics['F1 Score']:.3f}",
+    delta=f"{stress_metrics['F1 Score'] - clean_metrics['F1 Score']:.3f}"
+)
+
+st.subheader("Performance Degradation")
+
+degradation_df = pd.DataFrame({
+    "Metric": [
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "F1 Score",
+        "Balanced Accuracy",
+        "AUROC"
+    ],
+    "Clean": [
+        clean_metrics["Accuracy"],
+        clean_metrics["Precision"],
+        clean_metrics["Recall"],
+        clean_metrics["F1 Score"],
+        clean_metrics["Balanced Accuracy"],
+        clean_metrics["AUROC"]
+    ],
+    "Stressed": [
+        stress_metrics["Accuracy"],
+        stress_metrics["Precision"],
+        stress_metrics["Recall"],
+        stress_metrics["F1 Score"],
+        stress_metrics["Balanced Accuracy"],
+        stress_metrics["AUROC"]
+    ]
+})
+
+st.dataframe(
+    degradation_df.round(4),
+    use_container_width=True,
+    hide_index=True
 )
 
 st.caption(
-    "AUROC is threshold-free. Brier/ECE show whether confidence "
-    "is still meaningful. ECE uses equal-mass bins."
+    "Metrics compare the same held-out test rows under clean and "
+    "simulated stress conditions. Results are specific to this experiment."
 )
-
-with st.expander("Reliability (calibration) diagram"):
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=[0, 1],
-            y=[0, 1],
-            mode="lines",
-            name="perfect",
-            line=dict(dash="dash")
-        )
-    )
-
-    for n in models:
-
-        c = reliability_curve(
-            y_test,
-            proba_stress[n]
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=c[:, 0],
-                y=c[:, 1],
-                mode="lines+markers",
-                name=n
-            )
-        )
-
-    fig.update_layout(
-        xaxis_title="Predicted probability",
-        yaxis_title="Observed frequency"
-    )
-
-    st.plotly_chart(fig, width="stretch")
-
-
-# ==========================================
-# 02 ROBUSTNESS SWEEPS
-# ==========================================
-
-st.divider()
 st.header("02. Robustness sweeps (degradation curves)")
 
 SWEEPS = {
@@ -391,9 +441,7 @@ SWEEPS = {
 }
 
 
-@st.cache_data(show_spinner=False)
 def run_sweep(ds_name, fault, drift_feats, n_seeds):
-
     grid = SWEEPS[fault]
     out = []
 
@@ -957,6 +1005,19 @@ st.header(
     "07. Model recommendation (statistically qualified)"
 )
 
+perf_df = (
+    performance_df
+    .pivot(
+        index="Model",
+        columns="Condition",
+        values="AUROC"
+    )
+    .reset_index()
+    .rename(columns={
+        "Clean": "AUROC (clean)",
+        "Stressed": "AUROC (stressed)"
+    })
+)
 order = (
     perf_df.sort_values(
         "AUROC (stressed)",
@@ -1059,7 +1120,8 @@ FAILURE BREAKDOWN
 {breakdown.to_string(index=False)}
 
 LIMITATIONS
-- Synthetic data; faults are simulated, so causes are known only in this simulation.
+- Dataset may be uploaded or built-in; injected stress conditions are simulated.
+- Fault attribution estimates effects of injected faults, not proven real-world causes.
 - Verdict thresholds are conventions, not validated against real deployments.
 - Drift tests detect distribution change, not performance loss; see AUROC drop.
 - Feature-error associations are descriptive, not causal.
